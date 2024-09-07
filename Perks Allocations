@@ -1,0 +1,254 @@
+Assigning Loyalty Perks to Users
+
+[10]
+0s
+query = """
+-- Step 1: Aggregate booking data to determine loyalty perks
+WITH BookingAggregates AS (
+    SELECT
+        user_id,
+        SUM(CASE WHEN flight_booked THEN 1 ELSE 0 END) AS total_flights_booked, -- Total number of flights booked by user
+        SUM(CASE WHEN hotel_booked THEN 1 ELSE 0 END) AS total_hotels_booked -- Total number of hotels booked by user
+    FROM sessions
+    WHERE trip_id IS NOT NULL 
+-- Consider only valid trips
+    GROUP BY user_id
+)
+
+-- Step 2: Determine and assign loyalty perks based on booking data
+SELECT
+    user_id,
+    CASE
+        WHEN total_flights_booked > 10 OR total_hotels_booked > 5 THEN 'Platinum' -- Assign 'Platinum' for high booking volume
+        WHEN total_flights_booked > 5 OR total_hotels_booked > 3 THEN 'Gold' -- Assign 'Gold' for medium booking volume
+        WHEN total_flights_booked >= 1 AND total_hotels_booked >= 1 THEN 'Silver' -- Assign 'Silver' for moderate booking volume
+        ELSE 'Basic' -- Default to 'Basic' for users with fewer bookings
+    END AS loyalty_perk
+FROM BookingAggregates
+LIMIT 10;
+"""
+
+df = pd.read_sql(query, connection)
+print(df)
+
+   user_id loyalty_perk
+0        0       Silver
+1        1         Gold
+2        2       Silver
+3        3         Gold
+4        4       Silver
+5        5     Platinum
+6        6       Silver
+7        7     Platinum
+8        8       Silver
+9        9       Silver
+Screenshot 2024-09-05 at 22.56.06.png
+
+Loyalty Perks Query: This query assigns loyalty perks based on the number of flights and hotels booked by each user. The more bookings a user has, the higher their loyalty tier (Platinum, Gold, Silver, or Basic)
+
+Assigning Other Perks (No Cancellation Fees, Free Hotel Meal, etc
+
+[11]
+3s
+query = """
+-- Step 1: Aggregate session and booking data to determine additional perks
+WITH SessionAggregates AS (
+    SELECT
+        user_id,
+        SUM(CASE WHEN cancellation THEN 1 ELSE 0 END) AS total_cancellations, -- Count total cancellations by user
+        SUM(CASE WHEN flight_booked THEN 1 ELSE 0 END) AS total_flights_booked, -- Total number of flights booked
+        SUM(CASE WHEN hotel_booked THEN 1 ELSE 0 END) AS total_hotels_booked, -- Total number of hotels booked
+        SUM(COALESCE(hotel_per_room_usd, 0)) AS total_hotel_spent, -- Total spending on hotels
+        SUM(COALESCE(base_fare_usd, 0)) AS total_flight_spent -- Total spending on flights
+    FROM sessions
+    LEFT JOIN flights ON sessions.trip_id = flights.trip_id
+    LEFT JOIN hotels ON sessions.trip_id = hotels.trip_id
+    WHERE sessions.trip_id IS NOT NULL -- Consider only valid trips
+    GROUP BY user_id
+)
+
+-- Step 2: Determine and assign specific perks based on aggregated data
+SELECT
+    user_id,
+    CASE
+        WHEN total_cancellations = 0 AND (total_flights_booked + total_hotels_booked) >= 8 THEN 'No Cancellation Fees' -- Perk for users with high booking volume and no cancellations
+        WHEN total_hotels_booked >= 1 AND total_hotel_spent >= 500 THEN 'Free Hotel Meal' -- Perk for users with significant hotel spending
+        WHEN total_flights_booked >= 2 AND total_flight_spent >= 200 THEN 'Free Checked Bags' -- Perk for users with significant flight spending
+        WHEN total_flights_booked >= 1 AND total_hotels_booked >= 2 THEN 'One Night Free Hotel with Flight' -- Perk for users who book both flights and hotels
+        WHEN (total_flight_spent + total_hotel_spent) >= 100 THEN 'Exclusive Discount' -- Perk for users with moderate overall spending
+        ELSE 'Basic Perk' -- Default perk for users not meeting any specific criteria
+    END AS perk_name
+FROM SessionAggregates
+LIMIT 10;
+"""
+
+df = pd.read_sql(query, connection)
+print(df)
+
+
+   user_id                         perk_name
+0        0                 Free Checked Bags
+1        1                   Free Hotel Meal
+2        2                   Free Hotel Meal
+3        3                   Free Hotel Meal
+4        4                 Free Checked Bags
+5        5              No Cancellation Fees
+6        6  One Night Free Hotel with Flight
+7        7              No Cancellation Fees
+8        8                 Free Checked Bags
+9        9                   Free Hotel Meal
+Additional Perks Query: This query distributes additional perks based on user behavior such as no cancellations, high spending on hotels or flights, and a combination of flight and hotel bookings. Each perk is assigned based on specific criteria that reflect user activity.
+
+Screenshot 2024-09-05 at 22.58.12.png
+
+Retention Of User Before and After
+
+[13]
+30s
+query = """
+-- Step 1: Filter and classify sessions as 'Before Perks' and 'After Perks'
+WITH FilteredSessions AS (
+  SELECT
+    user_id,
+    session_id,
+    session_start,
+    session_end,
+    page_clicks,
+    flight_discount,
+    hotel_discount,
+    flight_booked,
+    hotel_booked,
+    cancellation,
+    trip_id,
+    CASE
+      WHEN session_start < '2023-01-04' THEN 'Before Perks'
+      ELSE 'After Perks'
+    END AS period
+  FROM sessions
+),
+
+-- Step 2: Aggregate the sessions data for each user and period
+AggregatedSessions AS (
+  SELECT
+    user_id,
+    period,
+    COUNT(DISTINCT session_id) AS num_sessions,               -- Count the number of unique sessions per user
+    SUM(page_clicks) AS total_page_clicks,                    -- Total page clicks across all sessions
+    SUM(CASE WHEN flight_discount THEN 1 ELSE 0 END) AS total_flight_discount, -- Count sessions with flight discounts
+    SUM(CASE WHEN hotel_discount THEN 1 ELSE 0 END) AS total_hotel_discount,   -- Count sessions with hotel discounts
+    SUM(CASE WHEN flight_booked THEN 1 ELSE 0 END) AS total_flights_booked,    -- Count sessions where a flight was booked
+    SUM(CASE WHEN hotel_booked THEN 1 ELSE 0 END) AS total_hotels_booked,      -- Count sessions where a hotel was booked
+    SUM(CASE WHEN cancellation THEN 1 ELSE 0 END) AS total_cancellations      -- Count sessions where a booking was canceled
+  FROM FilteredSessions
+  GROUP BY user_id, period
+),
+
+-- Step 3: Join sessions with flights and hotels to calculate overall spend for each period
+FlightsData AS (
+  SELECT
+    fs.user_id,
+    fs.period,
+    SUM(f.base_fare_usd) AS total_flight_spent,   -- Total amount spent on flights
+    SUM(f.checked_bags) AS total_checked_bags     -- Total number of checked bags
+  FROM FilteredSessions fs
+  JOIN flights f ON fs.trip_id = f.trip_id
+  GROUP BY fs.user_id, fs.period
+),
+
+HotelsData AS (
+  SELECT
+    fs.user_id,
+    fs.period,
+    SUM(h.hotel_per_room_usd) AS total_hotel_spent  -- Total amount spent on hotels
+  FROM FilteredSessions fs
+  JOIN hotels h ON fs.trip_id = h.trip_id
+  GROUP BY fs.user_id, fs.period
+)
+
+-- Step 4: Final query to combine all data for comparison before and after perks
+SELECT
+  u.user_id,
+  u.sign_up_date,
+
+  -- Before Perks Metrics
+  MAX(CASE WHEN a.period = 'Before Perks' THEN a.num_sessions ELSE 0 END) AS sessions_before,
+  MAX(CASE WHEN a.period = 'Before Perks' THEN a.total_flights_booked ELSE 0 END) AS flights_booked_before,
+  MAX(CASE WHEN a.period = 'Before Perks' THEN a.total_hotels_booked ELSE 0 END) AS hotels_booked_before,
+  MAX(CASE WHEN fd.period = 'Before Perks' THEN fd.total_flight_spent ELSE 0 END) AS flight_spent_before,
+  MAX(CASE WHEN hd.period = 'Before Perks' THEN hd.total_hotel_spent ELSE 0 END) AS hotel_spent_before,
+
+  -- After Perks Metrics
+  MAX(CASE WHEN a.period = 'After Perks' THEN a.num_sessions ELSE 0 END) AS sessions_after,
+  MAX(CASE WHEN a.period = 'After Perks' THEN a.total_flights_booked ELSE 0 END) AS flights_booked_after,
+  MAX(CASE WHEN a.period = 'After Perks' THEN a.total_hotels_booked ELSE 0 END) AS hotels_booked_after,
+  MAX(CASE WHEN fd.period = 'After Perks' THEN fd.total_flight_spent ELSE 0 END) AS flight_spent_after,
+  MAX(CASE WHEN hd.period = 'After Perks' THEN hd.total_hotel_spent ELSE 0 END) AS hotel_spent_after
+
+FROM users u
+LEFT JOIN AggregatedSessions a ON u.user_id = a.user_id
+LEFT JOIN FlightsData fd ON u.user_id = fd.user_id AND a.period = fd.period
+LEFT JOIN HotelsData hd ON u.user_id = hd.user_id AND a.period = hd.period
+
+GROUP BY u.user_id, u.sign_up_date
+ORDER BY u.user_id;
+"""
+df = pd.read_sql(query, connection)
+print(df)
+
+
+         user_id sign_up_date  sessions_before  flights_booked_before  \
+0              0   2021-04-01               10                      1   
+1              1   2021-04-01                6                      4   
+2              2   2021-04-01                6                      4   
+3              3   2021-04-01                8                      2   
+4              4   2021-04-01                8                      1   
+...          ...          ...              ...                    ...   
+1020921  1020921   2023-07-20                0                      0   
+1020922  1020922   2023-07-20                0                      0   
+1020923  1020923   2023-07-20                0                      0   
+1020924  1020924   2023-07-20                0                      0   
+1020925  1020925   2023-07-20                0                      0   
+
+         hotels_booked_before  flight_spent_before  hotel_spent_before  \
+0                           1               466.35                80.0   
+1                           5             10500.30               583.0   
+2                           3              3244.63               510.0   
+3                           4               798.13               702.0   
+4                           1              1499.39               241.0   
+...                       ...                  ...                 ...   
+1020921                     0                 0.00                 0.0   
+1020922                     0                 0.00                 0.0   
+1020923                     0                 0.00                 0.0   
+1020924                     0                 0.00                 0.0   
+1020925                     0                 0.00                 0.0   
+
+         sessions_after  flights_booked_after  hotels_booked_after  \
+0                     1                     1                    1   
+1                     1                     0                    0   
+2                     2                     0                    0   
+3                     1                     0                    0   
+4                     2                     1                    1   
+...                 ...                   ...                  ...   
+1020921               1                     0                    0   
+1020922               1                     1                    1   
+1020923               1                     1                    1   
+1020924               1                     0                    0   
+1020925               1                     0                    1   
+
+         flight_spent_after  hotel_spent_after  
+0                    205.16              130.0  
+1                      0.00                0.0  
+2                      0.00                0.0  
+3                      0.00                0.0  
+4                   1284.75               81.0  
+...                     ...                ...  
+1020921                0.00                0.0  
+1020922              246.65              169.0  
+1020923              141.43              215.0  
+1020924                0.00                0.0  
+1020925                0.00              264.0  
+
+[1020926 rows x 12 columns]
+Screenshot 2024-09-06 at 15.46.47.png
+
+
